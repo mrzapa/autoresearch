@@ -5,7 +5,6 @@ description = "Autonomous pretraining research swarm"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "kernels>=0.11.7",  # CUDA-only; safe to remove for AMD/ROCm
     "matplotlib>=3.10.8",
     "numpy>=2.2.6",
     "pandas>=2.3.3",
@@ -15,6 +14,9 @@ dependencies = [
     "tiktoken>=0.11.0",
     "torch==2.9.1",
 ]
+
+[project.optional-dependencies]
+cuda = ["kernels>=0.11.7"]  # FA3 kernels for NVIDIA GPUs
 
 [tool.uv.sources]
 torch = [

@@ -25,11 +25,15 @@ if IS_AMD:
     print("AMD GPU detected — using PyTorch SDPA for attention")
 else:
     # NVIDIA GPUs: use Flash Attention 3 kernels
-    from kernels import get_kernel
-    cap = torch.cuda.get_device_capability()
-    # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-    fa3 = get_kernel(repo).flash_attn_interface
+    try:
+        from kernels import get_kernel
+        cap = torch.cuda.get_device_capability()
+        # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+        repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+        fa3 = get_kernel(repo).flash_attn_interface
+    except ImportError:
+        fa3 = None
+        print("kernels package not found — falling back to PyTorch SDPA")
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -102,11 +106,26 @@ class CausalSelfAttention(nn.Module):
             y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
             # AMD path: use PyTorch SDPA (supports flash-attention backend on ROCm)
-            # SDPA expects (B, num_heads, T, head_dim)
+            # Expand KV heads to match Q heads for GQA (SDPA enable_gqa may not be
+            # available on all ROCm builds, so we expand manually for portability)
+            n_rep = self.n_head // self.n_kv_head
+            if n_rep > 1:
+                k = k.unsqueeze(3).expand(B, T, self.n_kv_head, n_rep, self.head_dim).reshape(B, T, self.n_head, self.head_dim)
+                v = v.unsqueeze(3).expand(B, T, self.n_kv_head, n_rep, self.head_dim).reshape(B, T, self.n_head, self.head_dim)
+            # (B, T, n_head, head_dim) -> (B, n_head, T, head_dim) for SDPA
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            # Sliding window via causal attention mask
+            win = window_size[0] if window_size[0] > 0 else T
+            if win < T:
+                # Build a band+causal mask: attend to at most `win` prior tokens
+                row_idx = torch.arange(T, device=q.device).unsqueeze(1)
+                col_idx = torch.arange(T, device=q.device).unsqueeze(0)
+                mask = (col_idx <= row_idx) & (col_idx >= row_idx - win + 1)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             y = y.transpose(1, 2)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
